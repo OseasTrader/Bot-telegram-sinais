@@ -1,7 +1,18 @@
 import os
+import threading
 import time
-import requests
+from flask import Flask
 from iqoptionapi.stable_api import IQ_Option
+import requests
+
+# Servidor Web para manter o Web Service do Render ativo gratuitamente
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "Bot Telegram IQ Option operacional!", 200
+
 
 # ==================== CONFIGURAÇÕES ====================
 BOT_TOKEN = os.getenv(
@@ -9,10 +20,9 @@ BOT_TOKEN = os.getenv(
 )
 CHAT_ID = os.getenv("CHAT_ID", "-1003565774427")
 
-# Credenciais lidas do ambiente (Render)
-IQ_USER = os.getenv("IQ_USER", "seu_email@exemplo.com")
-IQ_PASS = os.getenv("IQ_PASS", "sua_senha_aqui")
-IQ_MODE = os.getenv("IQ_MODE", "PRACTICE")  # PRACTICE ou REAL
+IQ_USER = os.getenv("IQ_USER", "")
+IQ_PASS = os.getenv("IQ_PASS", "")
+IQ_MODE = os.getenv("IQ_MODE", "PRACTICE")
 
 PARES = ["EURUSD", "GBPUSD", "USDJPY", "EURJPY"]
 
@@ -44,11 +54,9 @@ def conectar_iq_option():
         return None
 
 
-# ==================== ESTRATÉGIA OFICIAL ====================
+# ==================== ESTRATÉGIA ====================
 def analisar_estrategia(API, par):
-    """M5 Trend Sweep & Exaustão de Volume em M1."""
     try:
-        # 1. Dados M5 para Trend Sweep
         candles_m5 = API.get_candles(par, 300, 6, time.time())
         if not candles_m5 or len(candles_m5) < 5:
             return None
@@ -57,7 +65,6 @@ def analisar_estrategia(API, par):
         fundo_m5 = min(c["min"] for c in candles_m5[:-1])
         c_m5_atual = candles_m5[-1]
 
-        # 2. Dados M1 para Exaustão e Reversão
         candles_m1 = API.get_candles(par, 60, 5, time.time())
         if not candles_m1 or len(candles_m1) < 3:
             return None
@@ -65,7 +72,7 @@ def analisar_estrategia(API, par):
         m1_atual = candles_m1[-1]
         m1_anterior = candles_m1[-2]
 
-        # CALL (Compra)
+        # CALL
         sweep_fundo = (
             c_m5_atual["min"] < fundo_m5 and c_m5_atual["close"] > fundo_m5
         )
@@ -81,7 +88,7 @@ def analisar_estrategia(API, par):
         if sweep_fundo and exaustao_venda_m1 and rejeicao_m1_call:
             return "CALL"
 
-        # PUT (Venda)
+        # PUT
         sweep_topo = (
             c_m5_atual["max"] > topo_m5 and c_m5_atual["close"] < topo_m5
         )
@@ -103,7 +110,6 @@ def analisar_estrategia(API, par):
     return None
 
 
-# ==================== PROCESSAMENTO ====================
 def executar_sinal(API, par, sinal):
     try:
         candles_atuais = API.get_candles(par, 60, 1, time.time())
@@ -122,7 +128,6 @@ def executar_sinal(API, par, sinal):
 """
         enviar_mensagem(msg_sinal)
 
-        # Aguarda os 5 minutos (300 segundos) da vela
         time.sleep(300)
 
         c_fechamento = API.get_candles(par, 60, 1, time.time())
@@ -153,8 +158,8 @@ def executar_sinal(API, par, sinal):
         print(f"[ERRO EXECUCAO] {par}: {e}")
 
 
-# ==================== LOOP PRINCIPAL ====================
-if __name__ == "__main__":
+# ==================== LOOP DE EXECUÇÃO ====================
+def loop_principal():
     API = conectar_iq_option()
 
     while True:
@@ -169,3 +174,15 @@ if __name__ == "__main__":
                 executar_sinal(API, par, sinal)
 
         time.sleep(15)
+
+
+# ==================== INICIALIZAÇÃO ====================
+if __name__ == "__main__":
+    # Inicia a análise da IQ Option em segundo plano
+    t = threading.Thread(target=loop_principal)
+    t.daemon = True
+    t.start()
+
+    # Inicia o servidor web do Flask na porta do Render
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
