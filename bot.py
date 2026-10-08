@@ -7,18 +7,25 @@ import requests
 
 app = Flask(__name__)
 
+
 @app.route('/')
 def home():
     return "Bot Telegram IQ Option operacional!", 200
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8820964764:AAF0-VvQQEJvFJiLZaQA9nSWkvk5ZWoCGtU")
-CHAT_ID = os.getenv("CHAT_ID", "-1003565774427")
+
+# Configurações vindas das variáveis de ambiente do Render
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
 
 IQ_USER = os.getenv("IQ_USER", "")
 IQ_PASS = os.getenv("IQ_PASS", "")
 IQ_MODE = os.getenv("IQ_MODE", "PRACTICE")
 
 PARES = ["EURUSD", "GBPUSD", "USDJPY", "EURJPY"]
+
+# Controle para não repetir sinal do mesmo par em menos de 5 minutos
+ultimo_sinal = {}
+
 
 def enviar_mensagem(texto):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -34,22 +41,28 @@ def enviar_mensagem(texto):
         print(f"[ERRO TELEGRAM] {e}")
         return None
 
+
 def conectar_iq_option():
     print(f"Tentando conectar à IQ Option ({IQ_USER})...")
     if not IQ_USER or not IQ_PASS:
         print("❌ ERRO: IQ_USER ou IQ_PASS não foram preenchidos nas variáveis do Render!")
         return None
 
-    API = IQ_Option(IQ_USER, IQ_PASS)
-    check, reason = API.connect()
+    try:
+        API = IQ_Option(IQ_USER, IQ_PASS)
+        check, reason = API.connect()
+    except Exception as e:
+        print(f"❌ Erro ao conectar: {e}")
+        return None
 
     if check:
         print(f"✅ Conectado com sucesso à IQ Option! Modo: {IQ_MODE}")
         API.change_balance(IQ_MODE)
         return API
-    else:
-        print(f"❌ Falha na conexão com a IQ Option: {reason}")
-        return None
+
+    print(f"❌ Falha na conexão com a IQ Option: {reason}")
+    return None
+
 
 def analisar_estrategia(API, par):
     try:
@@ -86,6 +99,7 @@ def analisar_estrategia(API, par):
         print(f"[ERRO ANALISE] {par}: {e}")
 
     return None
+
 
 def executar_sinal(API, par, sinal):
     try:
@@ -134,6 +148,7 @@ def executar_sinal(API, par, sinal):
     except Exception as e:
         print(f"[ERRO EXECUCAO] {par}: {e}")
 
+
 def loop_principal():
     API = conectar_iq_option()
 
@@ -145,16 +160,34 @@ def loop_principal():
             continue
 
         for par in PARES:
+            if time.time() - ultimo_sinal.get(par, 0) < 300:
+                continue
+
             sinal = analisar_estrategia(API, par)
             if sinal:
-                executar_sinal(API, par, sinal)
+                ultimo_sinal[par] = time.time()
+                threading.Thread(
+                    target=executar_sinal,
+                    args=(API, par, sinal),
+                    daemon=True
+                ).start()
 
         time.sleep(15)
 
-if __name__ == "__main__":
-    t = threading.Thread(target=loop_principal)
-    t.daemon = True
-    t.start()
 
+# Inicia o bot uma única vez (funciona com gunicorn e com python main.py)
+_iniciado = False
+
+
+def iniciar_bot():
+    global _iniciado
+    if not _iniciado:
+        _iniciado = True
+        threading.Thread(target=loop_principal, daemon=True).start()
+
+
+iniciar_bot()
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host="0.0.0.0", port=port)
