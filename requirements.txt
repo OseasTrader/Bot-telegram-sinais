@@ -1,3 +1,4 @@
 requests
 iqoptionapi
 websocket-client==0.56.0
+flask
