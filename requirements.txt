@@ -1,5 +1,5 @@
 Flask==3.0.0
 gunicorn==21.2.0
 requests==2.31.0
-websocket-client==1.7.0
-git+https://github.com/Luiz-A-A/iqoptionapi.git
+websocket-client==0.56.0
+iqoptionapi
