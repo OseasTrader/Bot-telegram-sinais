@@ -43,14 +43,14 @@ def enviar_mensagem(texto):
 def conectar_iq_option():
     print(f"Conectando à IQ Option (Modo: {IQ_MODE})...")
     API = IQ_Option(IQ_USER, IQ_PASS)
-    API.connect()
+    check, reason = API.connect()
 
-    if API.check_connect():
+    if check:
         print("✅ Conectado com sucesso à IQ Option!")
         API.change_balance(IQ_MODE)
         return API
     else:
-        print("❌ Falha na conexão com a IQ Option.")
+        print(f"❌ Falha na conexão com a IQ Option: {reason}")
         return None
 
 
@@ -178,11 +178,9 @@ def loop_principal():
 
 # ==================== INICIALIZAÇÃO ====================
 if __name__ == "__main__":
-    # Inicia a análise da IQ Option em segundo plano
     t = threading.Thread(target=loop_principal)
     t.daemon = True
     t.start()
 
-    # Inicia o servidor web do Flask na porta do Render
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
