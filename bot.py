@@ -2,11 +2,30 @@ import os
 import json
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 import requests
 import websocket
 from flask import Flask
 
 app = Flask(__name__)
+
+BRT = timezone(timedelta(hours=-3))
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
+WS_URL = os.getenv("DERIV_WS_URL", "wss://api.derivws.com/trading/v1/options/ws/public")
+PARES = [p.strip() for p in os.getenv("PARES", "frxEURUSD,frxGBPUSD,frxUSDJPY,frxEURJPY").split(",") if p.strip()]
+
+JANELA_ENTRADA = 60
+PAVIO_MIN = 0.4
+
+ultimo_processado = {}
+ws_lock = threading.Lock()
+_ws = None
+_req_id = 0
+
+placar = {"dia": None, "WIN": 0, "LOSS": 0, "EMPATE": 0}
+placar_lock = threading.Lock()
 
 
 @app.route('/')
@@ -14,15 +33,40 @@ def home():
     return "Bot Telegram M5 Trend Sweep operacional!", 200
 
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
-WS_URL = os.getenv("DERIV_WS_URL", "wss://api.derivws.com/trading/v1/options/ws/public")
-PARES = [p.strip() for p in os.getenv("PARES", "frxEURUSD,frxGBPUSD,frxUSDJPY,frxEURJPY").split(",") if p.strip()]
+@app.route('/placar')
+def ver_placar():
+    with placar_lock:
+        return f"{placar['dia']}: {texto_placar(placar)}", 200
 
-ultimo_sinal = {}
-ws_lock = threading.Lock()
-_ws = None
-_req_id = 0
+
+def hoje_brt():
+    return datetime.now(BRT).strftime("%d/%m/%Y")
+
+
+def texto_placar(p):
+    decididos = p["WIN"] + p["LOSS"]
+    taxa = f"{p['WIN'] / decididos * 100:.0f}%" if decididos else "-"
+    return f"✅ {p['WIN']} | ❌ {p['LOSS']} | ⚪ {p['EMPATE']} | Acerto: {taxa}"
+
+
+def virar_dia_se_preciso():
+    dia = hoje_brt()
+    resumo = None
+    with placar_lock:
+        if placar["dia"] != dia:
+            total = placar["WIN"] + placar["LOSS"] + placar["EMPATE"]
+            if placar["dia"] and total > 0:
+                resumo = f"📋 *RESUMO DO DIA {placar['dia']}*\n\n" + texto_placar(placar)
+            placar.update({"dia": dia, "WIN": 0, "LOSS": 0, "EMPATE": 0})
+    if resumo:
+        enviar_mensagem(resumo)
+
+
+def registrar_resultado(resultado):
+    virar_dia_se_preciso()
+    with placar_lock:
+        placar[resultado] += 1
+        return texto_placar(placar)
 
 
 def enviar_mensagem(texto):
@@ -37,7 +81,6 @@ def enviar_mensagem(texto):
 
 
 def pedir(payload):
-    """Envia um pedido à Deriv (uma conexão, um pedido por vez)."""
     global _ws, _req_id
     with ws_lock:
         for _ in range(2):
@@ -87,59 +130,75 @@ def preco_atual(par):
         return None
 
 
-def volumes_m1(par):
-    """Conta ticks por minuto. Retorna (minuto atual, minuto anterior)."""
-    resp = pedir({"ticks_history": par, "count": 2000, "end": "latest", "style": "ticks"})
+def volumes_por_vela(par):
+    resp = pedir({"ticks_history": par, "count": 3000, "end": "latest", "style": "ticks"})
     try:
         tempos = [int(t) for t in resp["history"]["times"]]
     except Exception:
+        return {}
+    vols = {}
+    for t in tempos:
+        b = t // 300 * 300
+        vols[b] = vols.get(b, 0) + 1
+    return vols
+
+
+def ema(valores, periodo):
+    k = 2 / (periodo + 1)
+    e = sum(valores[:periodo]) / periodo
+    for v in valores[periodo:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def analisar_estrategia(par, velas):
+    nome = par.replace("frx", "")
+    fechadas = velas[:-1]
+    if len(fechadas) < 60:
         return None
-    if not tempos:
+
+    s, p1, p2, p3 = fechadas[-1], fechadas[-2], fechadas[-3], fechadas[-4]
+    closes = [float(c['close']) for c in fechadas]
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
+
+    o, h, l, c = float(s['open']), float(s['high']), float(s['low']), float(s['close'])
+    faixa = h - l
+    if faixa <= 0:
         return None
-    minuto = tempos[-1] // 60
-    atual = sum(1 for t in tempos if t // 60 == minuto)
-    anterior = sum(1 for t in tempos if t // 60 == minuto - 1)
-    return atual, anterior
 
+    vols = volumes_por_vela(par)
+    vs = vols.get(int(s['epoch']), 0)
+    v1 = vols.get(int(p1['epoch']), 0)
+    v2 = vols.get(int(p2['epoch']), 0)
+    print(f"[{nome}] M5 fechada | EMA20={ema20:.5f} EMA50={ema50:.5f} | volume {v2}>{v1}>{vs}")
 
-def analisar_estrategia(par):
-    try:
-        m5 = pegar_velas(par, 300, 6)
-        if not m5 or len(m5) < 5:
-            return None
-        m1 = pegar_velas(par, 60, 5)
-        if not m1 or len(m1) < 3:
-            return None
+    if min(vs, v1, v2) == 0:
+        return None
+    if not (vs < v1 and vs < v2):
+        return None
 
-        topo_m5 = max(float(c['high']) for c in m5[:-1])
-        fundo_m5 = min(float(c['low']) for c in m5[:-1])
-        m5_atual = m5[-1]
+    pavio_sup = h - max(o, c)
+    pavio_inf = min(o, c) - l
 
-        a = m1[-1]
-        a_open, a_close = float(a['open']), float(a['close'])
-        a_high, a_low = float(a['high']), float(a['low'])
-
-        vols = volumes_m1(par)
-        vol_menor = bool(vols) and vols[0] < vols[1]
-
-        sweep_fundo = float(m5_atual['low']) < fundo_m5 and float(m5_atual['close']) > fundo_m5
-        exaustao_venda = vol_menor and a_close < a_open
-        rejeicao_call = a_close > a_open or (a_high - a_close) < (a_close - a_low)
-        if sweep_fundo and exaustao_venda and rejeicao_call:
-            return "CALL"
-
-        sweep_topo = float(m5_atual['high']) > topo_m5 and float(m5_atual['close']) < topo_m5
-        exaustao_compra = vol_menor and a_close > a_open
-        rejeicao_put = a_close < a_open or (a_close - a_low) < (a_high - a_close)
-        if sweep_topo and exaustao_compra and rejeicao_put:
+    if ema20 < ema50:
+        pullback_alta = float(p1['close']) > float(p3['close'])
+        testou = h >= float(p1['high']) or h >= ema20
+        rejeicao = pavio_sup >= PAVIO_MIN * faixa and c <= l + faixa / 3
+        if pullback_alta and testou and rejeicao:
             return "PUT"
 
-    except Exception as e:
-        print(f"[ERRO ANALISE] {par}: {e}")
+    if ema20 > ema50:
+        pullback_baixa = float(p1['close']) < float(p3['close'])
+        testou = l <= float(p1['low']) or l <= ema20
+        rejeicao = pavio_inf >= PAVIO_MIN * faixa and c >= h - faixa / 3
+        if pullback_baixa and testou and rejeicao:
+            return "CALL"
+
     return None
 
 
-def executar_sinal(par, sinal):
+def executar_sinal(par, sinal, epoch_vela):
     try:
         preco_entrada = preco_atual(par)
         if preco_entrada is None:
@@ -158,10 +217,18 @@ def executar_sinal(par, sinal):
 ⚠️ _Respeite o seu gerenciamento!_
 """)
 
-        time.sleep(300)
+        espera = (epoch_vela + 300 + 3) - time.time()
+        if espera > 0:
+            time.sleep(espera)
 
-        preco_fechamento = preco_atual(par)
+        preco_fechamento = None
+        for _ in range(3):
+            preco_fechamento = preco_atual(par)
+            if preco_fechamento is not None:
+                break
+            time.sleep(5)
         if preco_fechamento is None:
+            enviar_mensagem(f"⚠️ Não consegui obter o fechamento de `{nome}`. Confira o resultado no gráfico.")
             return
 
         resultado = "EMPATE"
@@ -176,7 +243,11 @@ def executar_sinal(par, sinal):
             elif preco_fechamento > preco_entrada:
                 resultado = "LOSS"
 
-        detalhes = f"\n\n*PAR:* `{nome}`\n*ENTRADA:* `{preco_entrada}`\n*FECHAMENTO:* `{preco_fechamento}`"
+        linha_placar = registrar_resultado(resultado)
+        detalhes = (
+            f"\n\n*PAR:* `{nome}`\n*ENTRADA:* `{preco_entrada}`\n*FECHAMENTO:* `{preco_fechamento}`"
+            f"\n\n📊 *Placar do dia:* {linha_placar}"
+        )
         if resultado == "WIN":
             enviar_mensagem("✅ *RESULTADO: WIN!* 🟢" + detalhes)
         elif resultado == "LOSS":
@@ -189,21 +260,31 @@ def executar_sinal(par, sinal):
 
 
 def loop_principal():
-    teste = pegar_velas(PARES[0], 60, 3)
+    teste = pegar_velas(PARES[0], 300, 3)
     if teste:
         print(f"✅ Dados da Deriv funcionando. Pares: {PARES}")
     else:
         print("❌ Não consegui ler dados da Deriv (confira o par ou o mercado aberto)")
 
     while True:
+        virar_dia_se_preciso()
         for par in PARES:
-            if time.time() - ultimo_sinal.get(par, 0) < 300:
-                continue
-            sinal = analisar_estrategia(par)
-            if sinal:
-                ultimo_sinal[par] = time.time()
-                threading.Thread(target=executar_sinal, args=(par, sinal), daemon=True).start()
-        time.sleep(15)
+            try:
+                velas = pegar_velas(par, 300, 120)
+                if not velas or len(velas) < 60:
+                    continue
+                epoch = int(velas[-1]['epoch'])
+                if ultimo_processado.get(par) == epoch:
+                    continue
+                ultimo_processado[par] = epoch
+                if time.time() - epoch > JANELA_ENTRADA:
+                    continue
+                sinal = analisar_estrategia(par, velas)
+                if sinal:
+                    threading.Thread(target=executar_sinal, args=(par, sinal, epoch), daemon=True).start()
+            except Exception as e:
+                print(f"[ERRO LOOP] {par}: {e}")
+        time.sleep(10)
 
 
 _iniciado = False
