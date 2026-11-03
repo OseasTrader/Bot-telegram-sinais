@@ -16,32 +16,63 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 WS_URL = os.getenv("DERIV_WS_URL", "wss://api.derivws.com/trading/v1/options/ws/public")
 PARES = [p.strip() for p in os.getenv("PARES", "frxEURUSD,frxGBPUSD,frxUSDJPY,frxEURJPY").split(",") if p.strip()]
 
-JANELA_ENTRADA = 60
-PAVIO_MIN = 0.4
-QTD_VELAS = 300
-PIVOT_K = 6
-PIVOT_LOOKBACK = 288
+# ------------------------------------------------------------ configuração
+JANELA_ENTRADA = 60          # segundos após abrir a vela nova em que ainda aceita sinal
+QTD_VELAS = 300              # candles M5 analisados
+PAVIO_MIN = 0.4              # pavio mínimo (fração da vela) na rejeição
 
+NOME_ESTRATEGIA = "Retração em Zona Forte"
+EXPIRACAO_VELAS = int(os.getenv("EXPIRACAO_VELAS", "3"))      # 3 velas M5 = 15 min
+SCORE_MIN = int(os.getenv("SCORE_MIN", "6"))                  # força mínima da zona (máx. 9)
+COOLDOWN_ZONA = int(os.getenv("COOLDOWN_ZONA", "2700"))       # seg. sem repetir sinal na mesma zona
+ZONAS_ATUALIZA = 900                                          # seg. entre recálculos das zonas
+
+# Proteções
+MAX_LOSS_SEGUIDOS = int(os.getenv("MAX_LOSS_SEGUIDOS", "3"))  # pausa após X losses seguidos
+PAUSA_MIN = int(os.getenv("PAUSA_MIN", "60"))                 # minutos de pausa
+HORA_INI = int(os.getenv("HORA_INI", "5"))                    # horário BRT (Londres ~05h)
+HORA_FIM = int(os.getenv("HORA_FIM", "17"))                   # horário BRT (NY até ~17h)
+# Janelas de notícia a evitar (BRT), ex.: "09:25-09:50,15:25-15:50"
+BLOQUEIOS_TXT = os.getenv("JANELAS_BLOQUEIO", "")
+
+
+def _parse_bloqueios(txt):
+    out = []
+    for item in txt.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            a, b = item.split("-")
+            h1, m1 = a.split(":")
+            h2, m2 = b.split(":")
+            out.append((int(h1) * 60 + int(m1), int(h2) * 60 + int(m2)))
+        except Exception:
+            print(f"[AVISO] bloqueio inválido ignorado: {item}")
+    return out
+
+
+BLOQUEIOS = _parse_bloqueios(BLOQUEIOS_TXT)
+
+# ------------------------------------------------------------ estado
 ultimo_processado = {}
-quebras_usadas = set()
 ws_lock = threading.Lock()
 _ws = None
 _req_id = 0
 
+zonas_cache = {}
+ultimo_sinal_zona = {}
+sinais_abertos = set()
+estado_lock = threading.Lock()
+
 placar = {"dia": None, "WIN": 0, "LOSS": 0, "EMPATE": 0}
 placar_lock = threading.Lock()
+protecao = {"loss_seguidos": 0, "pausado_ate": 0.0}
 
-# ⏱️ CONFIGURAÇÃO DE EXPIRAÇÃO POR ESTRATÉGIA
-EXPIRACAO = {
-    "M5 Trend Sweep": 1,           # 5 minutos
-    "Rejeição Dupla na Zona Chave": 3,    # 15 minutos ✅
-    "Quebra e Reteste Limpos": 4,         # 20 minutos ✅
-    "Absorção de Força": 3                 # 15 minutos ✅
-}
 
 @app.route('/')
 def home():
-    return "Bot Telegram M5 — Expirações Corretas Operacional!", 200
+    return "Bot Telegram M5 — Retração em Zonas Fortes operacional!", 200
 
 
 @app.route('/placar')
@@ -50,6 +81,18 @@ def ver_placar():
         return f"{placar['dia']}: {texto_placar(placar)}", 200
 
 
+@app.route('/zonas')
+def ver_zonas():
+    linhas = []
+    for par, d in zonas_cache.items():
+        linhas.append(par)
+        for z in d["zonas"]:
+            if z["score"] >= SCORE_MIN:
+                linhas.append(f"  {z['low']:.5f} - {z['high']:.5f} | força {z['score']} | {z['origem']}")
+    return "\n".join(linhas) or "sem zonas ainda", 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+# ------------------------------------------------------------ utilidades
 def hoje_brt():
     return datetime.now(BRT).strftime("%d/%m/%Y")
 
@@ -69,15 +112,50 @@ def virar_dia_se_preciso():
             if placar["dia"] and total > 0:
                 resumo = f"📋 *RESUMO DO DIA {placar['dia']}*\n\n" + texto_placar(placar)
             placar.update({"dia": dia, "WIN": 0, "LOSS": 0, "EMPATE": 0})
+            protecao["loss_seguidos"] = 0
+            protecao["pausado_ate"] = 0.0
     if resumo:
         enviar_mensagem(resumo)
 
 
 def registrar_resultado(resultado):
     virar_dia_se_preciso()
+    aviso_pausa = False
     with placar_lock:
         placar[resultado] += 1
-        return texto_placar(placar)
+        linha = texto_placar(placar)
+        if resultado == "LOSS":
+            protecao["loss_seguidos"] += 1
+            if protecao["loss_seguidos"] >= MAX_LOSS_SEGUIDOS:
+                protecao["pausado_ate"] = time.time() + PAUSA_MIN * 60
+                protecao["loss_seguidos"] = 0
+                aviso_pausa = True
+        elif resultado == "WIN":
+            protecao["loss_seguidos"] = 0
+    if aviso_pausa:
+        enviar_mensagem(
+            f"⏸️ *BOT EM PAUSA*\n\n{MAX_LOSS_SEGUIDOS} losses seguidos. "
+            f"Sem novos sinais por {PAUSA_MIN} minutos."
+        )
+    return linha
+
+
+def em_pausa():
+    with placar_lock:
+        return time.time() < protecao["pausado_ate"]
+
+
+def horario_permitido():
+    agora = datetime.now(BRT)
+    if agora.weekday() >= 5:
+        return False
+    if not (HORA_INI <= agora.hour < HORA_FIM):
+        return False
+    hm = agora.hour * 60 + agora.minute
+    for ini, fim in BLOQUEIOS:
+        if ini <= hm <= fim:
+            return False
+    return True
 
 
 def enviar_mensagem(texto):
@@ -91,6 +169,7 @@ def enviar_mensagem(texto):
         return None
 
 
+# ------------------------------------------------------------ Deriv
 def pedir(payload):
     global _ws, _req_id
     with ws_lock:
@@ -141,41 +220,7 @@ def preco_atual(par):
         return None
 
 
-def volumes_por_vela(par):
-    resp = pedir({"ticks_history": par, "count": 5000, "end": "latest", "style": "ticks"})
-    try:
-        tempos = [int(t) for t in resp["history"]["times"]]
-    except Exception:
-        return {}
-    vols = {}
-    for t in tempos:
-        b = t // 300 * 300
-        vols[b] = vols.get(b, 0) + 1
-    if len(vols) > 1:
-        vols.pop(min(vols))
-    return vols
-
-
-def ema(valores, periodo):
-    k = 2 / (periodo + 1)
-    e = sum(valores[:periodo]) / periodo
-    for v in valores[periodo:]:
-        e = v * k + e * (1 - k)
-    return e
-
-
-def rsi_serie(closes, periodo=14):
-    a = 1.0 / periodo
-    au = ad = 0.0
-    out = [50.0]
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        au += a * (max(d, 0.0) - au)
-        ad += a * (max(-d, 0.0) - ad)
-        out.append(100 - 100 / (1 + au / (ad if ad else 1e-9)))
-    return out
-
-
+# ------------------------------------------------------------ indicadores
 def atr_serie(H, L, C, periodo=14):
     a = 1.0 / periodo
     out = []
@@ -192,201 +237,190 @@ def tamanho_pip(par):
     return 0.01 if "JPY" in par else 0.0001
 
 
-def calcular_pivots(H, L, k=PIVOT_K):
+def casas(par):
+    return 3 if "JPY" in par else 5
+
+
+# ------------------------------------------------------------ zonas fortes
+def pivots_simples(H, L, k):
+    """Fractais: topo/fundo maior/menor que k velas de cada lado."""
     piv = []
     for j in range(k, len(H) - k):
         if H[j] == max(H[j - k:j + k + 1]):
-            piv.append((j + k, H[j]))
+            piv.append((j, "H", H[j]))
         if L[j] == min(L[j - k:j + k + 1]):
-            piv.append((j + k, L[j]))
-    piv.sort(key=lambda x: x[0])
+            piv.append((j, "L", L[j]))
     return piv
 
 
-def niveis_em(piv, i):
-    return [lv for (ci, lv) in piv if i - PIVOT_LOOKBACK <= ci <= i]
+def montar_zonas(par, h1, h4, d1):
+    """Agrupa pivôs de H1/H4 em zonas e dá nota de força (0 a 9).
 
-
-# ---------------------------------------------------------------- estratégias
-
-def estrategia_trend_sweep(par, fechadas, ema20, ema50, vols):
-    s = fechadas[-1]
-    p1, p2, p3 = fechadas[-2], fechadas[-3], fechadas[-4]
-    o, h, l, c = float(s['open']), float(s['high']), float(s['low']), float(s['close'])
-    faixa = h - l
-    if faixa <= 0:
-        return None
-
-    vs = vols.get(int(s['epoch']), 0)
-    v1 = vols.get(int(p1['epoch']), 0)
-    v2 = vols.get(int(p2['epoch']), 0)
-
-    if min(vs, v1, v2) == 0:
-        return None
-    if not (vs < v1 and vs < v2):
-        return None
-
-    pavio_sup = h - max(o, c)
-    pavio_inf = min(o, c) - l
-
-    if ema20 < ema50:
-        pullback_alta = float(p1['close']) > float(p3['close'])
-        testou = h >= float(p1['high']) or h >= ema20
-        rejeicao = pavio_sup >= PAVIO_MIN * faixa and c <= l + faixa / 3
-        if pullback_alta and testou and rejeicao:
-            return "PUT"
-
-    if ema20 > ema50:
-        pullback_baixa = float(p1['close']) < float(p3['close'])
-        testou = l <= float(p1['low']) or l <= ema20
-        rejeicao = pavio_inf >= PAVIO_MIN * faixa and c >= h - faixa / 3
-        if pullback_baixa and testou and rejeicao:
-            return "CALL"
-
-    return None
-
-
-def estrategia_rejeicao_dupla(par, O, H, L, C, rsi, ema20, ema50, piv):
+    Pontuação:
+      + toques (1 por pivô agrupado, máx. 4)
+      + 2 se saiu impulso forte (>= 1,5x ATR) a partir da zona
+      + 1 se a zona tem pivô de H4
+      + 1 se coincide com número redondo (múltiplo de 50 pips)
+      + 1 se coincide com máxima/mínima do dia anterior
+    """
     pip = tamanho_pip(par)
-    tol = 2 * pip
-    i = len(C) - 1
-    a, b = i - 1, i
-    faixa_a, faixa_b = H[a] - L[a], H[b] - L[b]
-    if faixa_a < 1.5 * pip or faixa_b < 1.5 * pip:
-        return None
-    corpo_a, corpo_b = abs(C[a] - O[a]), abs(C[b] - O[b])
-    lv = niveis_em(piv, i)
+    pts = []
+    atr_ref = None
 
-    if ema20 > ema50:
-        wa = min(O[a], C[a]) - L[a]
-        wb = min(O[b], C[b]) - L[b]
-        if wa >= 2 * corpo_a and wa >= .5 * faixa_a and wb >= 2 * corpo_b and wb >= .5 * faixa_b:
-            if min(rsi[i - 3:i + 1]) < 30 and rsi[i] > 30 and rsi[i] > rsi[i - 1]:
-                m = min(L[a], L[b])
-                if any(m - tol <= x <= m + tol and x < C[a] and x < C[b] for x in lv):
-                    return "CALL"
-
-    if ema20 < ema50:
-        wa = H[a] - max(O[a], C[a])
-        wb = H[b] - max(O[b], C[b])
-        if wa >= 2 * corpo_a and wa >= .5 * faixa_a and wb >= 2 * corpo_b and wb >= .5 * faixa_b:
-            if max(rsi[i - 3:i + 1]) > 70 and rsi[i] < 70 and rsi[i] < rsi[i - 1]:
-                m = max(H[a], H[b])
-                if any(m - tol <= x <= m + tol and x > C[a] and x > C[b] for x in lv):
-                    return "PUT"
-    return None
-
-
-def estrategia_quebra_reteste(par, epochs, O, H, L, C, rsi, atr, piv, vols):
-    pip = tamanho_pip(par)
-    tol = 2 * pip
-    j = len(C) - 1
-    for k in range(2, 5):
-        i = j - k
-        if i < 60:
+    for tf, velas, k in (("H1", h1, 3), ("H4", h4, 3)):
+        if not velas:
             continue
-        if (par, epochs[i]) in quebras_usadas:
+        fech = velas[:-1]
+        if len(fech) < 30:
             continue
-        vi = vols.get(epochs[i], 0)
-        ref = [vols.get(epochs[x], 0) for x in range(i - 20, i)]
-        ref = [v for v in ref if v > 0]
-        if vi == 0 or len(ref) < 8:
-            continue
-        if vi < 1.3 * (sum(ref) / len(ref)):
-            continue
-        if abs(C[i] - O[i]) < .5 * atr[i]:
-            continue
-        lv = niveis_em(piv, i - 1)
+        H = [float(c["high"]) for c in fech]
+        L = [float(c["low"]) for c in fech]
+        C = [float(c["close"]) for c in fech]
+        atr = atr_serie(H, L, C)
+        if tf == "H1":
+            atr_ref = atr[-1]
+        for j, tipo, nivel in pivots_simples(H, L, k):
+            fim = min(len(H), j + 7)
+            if fim > j + 1:
+                if tipo == "H":
+                    mov = nivel - min(L[j + 1:fim])
+                else:
+                    mov = max(H[j + 1:fim]) - nivel
+            else:
+                mov = 0.0
+            pts.append({"nivel": nivel, "tf": tf, "imp": mov >= 1.5 * atr[j]})
 
-        cand = [x for x in lv if C[i] > x and C[i - 1] <= x]
-        if cand:
-            lvl = cand[0]
-            if not any(C[x] < lvl for x in range(i + 1, j)):
-                if L[j] <= lvl + tol and C[j] > lvl and 50 < rsi[j] < 70:
-                    quebras_usadas.add((par, epochs[i]))
-                    return "CALL"
+    if not pts or not atr_ref:
+        return []
 
-        cand = [x for x in lv if C[i] < x and C[i - 1] >= x]
-        if cand:
-            lvl = cand[-1]
-            if not any(C[x] > lvl for x in range(i + 1, j)):
-                if H[j] >= lvl - tol and C[j] < lvl and 30 < rsi[j] < 50:
-                    quebras_usadas.add((par, epochs[i]))
-                    return "PUT"
-    return None
+    # níveis do dia anterior
+    d1_niveis = []
+    if d1 and len(d1) >= 2:
+        d1_niveis = [float(d1[-2]["high"]), float(d1[-2]["low"])]
+
+    tol = 0.5 * atr_ref
+    pts.sort(key=lambda p: p["nivel"])
+    grupos, atual = [], [pts[0]]
+    for p in pts[1:]:
+        if p["nivel"] - atual[0]["nivel"] <= tol:
+            atual.append(p)
+        else:
+            grupos.append(atual)
+            atual = [p]
+    grupos.append(atual)
+
+    passo_redondo = 50 * pip
+    zonas = []
+    for g in grupos:
+        low = min(p["nivel"] for p in g)
+        high = max(p["nivel"] for p in g)
+        if high - low < 0.2 * atr_ref:
+            pad = 0.1 * atr_ref
+            low -= pad
+            high += pad
+        centro = (low + high) / 2
+
+        score = min(len(g), 4)
+        origem = set(p["tf"] for p in g)
+        if any(p["imp"] for p in g):
+            score += 2
+        if "H4" in origem:
+            score += 1
+        m = round(centro / passo_redondo) * passo_redondo
+        if low - 0.1 * atr_ref <= m <= high + 0.1 * atr_ref:
+            score += 1
+        if any(low - 0.1 * atr_ref <= n <= high + 0.1 * atr_ref for n in d1_niveis):
+            score += 1
+
+        zonas.append({
+            "low": low, "high": high, "score": score,
+            "origem": "+".join(sorted(origem)), "toques": len(g),
+        })
+
+    zonas.sort(key=lambda z: z["score"], reverse=True)
+    return zonas
 
 
-def estrategia_absorcao(par, O, H, L, C, rsi, ema20, ema50):
+def obter_zonas(par):
+    agora = time.time()
+    c = zonas_cache.get(par)
+    if c and agora - c["ts"] < ZONAS_ATUALIZA:
+        return c["zonas"]
+    h1 = pegar_velas(par, 3600, 500)
+    h4 = pegar_velas(par, 14400, 250)
+    d1 = pegar_velas(par, 86400, 5)
+    if not h1 and not h4:
+        return c["zonas"] if c else []
+    zonas = montar_zonas(par, h1, h4, d1)
+    zonas_cache[par] = {"ts": agora, "zonas": zonas}
+    fortes = [z for z in zonas if z["score"] >= SCORE_MIN]
+    print(f"[ZONAS] {par}: {len(zonas)} zonas, {len(fortes)} fortes (>= {SCORE_MIN})")
+    return zonas
+
+
+# ------------------------------------------------------------ gatilho M5
+def sinal_retracao(par, O, H, L, C, zonas, atr5):
+    """Preço volta à zona forte e a vela M5 fechada mostra rejeição."""
     pip = tamanho_pip(par)
     i = len(C) - 1
-    a, b = i - 1, i
-    if a < 21:
+    faixa = H[i] - L[i]
+    if faixa < 1.5 * pip:
         return None
-    corpos = [abs(C[x] - O[x]) for x in range(a - 20, a)]
-    media_corpo = sum(corpos) / len(corpos)
-    corpo_a, corpo_b = abs(C[a] - O[a]), abs(C[b] - O[b])
-    faixa_a = H[a] - L[a]
-    if faixa_a <= 0:
-        return None
-    forte = corpo_a >= 1.2 * media_corpo and corpo_a >= .7 * faixa_a and corpo_a >= 2 * pip
-    if not forte or corpo_b >= .3 * corpo_a:
-        return None
-    meio = (O[a] + C[a]) / 2
+    pavio_inf = min(O[i], C[i]) - L[i]
+    pavio_sup = H[i] - max(O[i], C[i])
+    tol = max(2 * pip, 0.3 * atr5)
+    anteriores = C[i - 8:i]
 
-    if C[a] > O[a]:
-        if (C[a] >= H[a] - .15 * faixa_a and min(C[b], O[b]) >= meio and rsi[i] > rsi[a]
-                and rsi[i] < 70 and C[i] > ema20 and C[i] > ema50):
-            return "CALL"
-    else:
-        if (C[a] <= L[a] + .15 * faixa_a and max(C[b], O[b]) <= meio and rsi[i] < rsi[a]
-                and rsi[i] > 30 and C[i] < ema20 and C[i] < ema50):
-            return "PUT"
+    for z in zonas:
+        if z["score"] < SCORE_MIN:
+            continue
+        chave = (par, round(z["low"], 5))
+        if time.time() - ultimo_sinal_zona.get(chave, 0) < COOLDOWN_ZONA:
+            continue
+
+        # SUPORTE: veio de cima, pavio entrou na zona, fechou acima dela
+        if sum(1 for x in anteriores if x > z["high"]) >= 6:
+            if (L[i] <= z["high"] + tol and L[i] >= z["low"] - tol
+                    and C[i] > z["high"] and C[i] > O[i]
+                    and C[i] >= L[i] + 0.5 * faixa
+                    and pavio_inf >= PAVIO_MIN * faixa):
+                ultimo_sinal_zona[chave] = time.time()
+                return "CALL", z
+
+        # RESISTÊNCIA: veio de baixo, pavio entrou na zona, fechou abaixo dela
+        if sum(1 for x in anteriores if x < z["low"]) >= 6:
+            if (H[i] >= z["low"] - tol and H[i] <= z["high"] + tol
+                    and C[i] < z["low"] and C[i] < O[i]
+                    and C[i] <= H[i] - 0.5 * faixa
+                    and pavio_sup >= PAVIO_MIN * faixa):
+                ultimo_sinal_zona[chave] = time.time()
+                return "PUT", z
     return None
 
 
 def analisar_estrategia(par, velas):
     fechadas = velas[:-1]
-    if len(fechadas) < 100:
+    if len(fechadas) < 60:
+        return None
+    O = [float(c["open"]) for c in fechadas]
+    H = [float(c["high"]) for c in fechadas]
+    L = [float(c["low"]) for c in fechadas]
+    C = [float(c["close"]) for c in fechadas]
+    atr5 = atr_serie(H, L, C)[-1]
+
+    zonas = obter_zonas(par)
+    if not zonas:
         return None
 
-    epochs = [int(c['epoch']) for c in fechadas]
-    O = [float(c['open']) for c in fechadas]
-    H = [float(c['high']) for c in fechadas]
-    L = [float(c['low']) for c in fechadas]
-    C = [float(c['close']) for c in fechadas]
-
-    ema20, ema50 = ema(C, 20), ema(C, 50)
-    rsi = rsi_serie(C)
-    atr = atr_serie(H, L, C)
-    piv = calcular_pivots(H, L)
-    vols = volumes_por_vela(par)
-
-    sinal = estrategia_trend_sweep(par, fechadas, ema20, ema50, vols)
-    if sinal:
-        nome = "M5 Trend Sweep"
-        return sinal, nome, EXPIRACAO[nome]
-
-    sinal = estrategia_rejeicao_dupla(par, O, H, L, C, rsi, ema20, ema50, piv)
-    if sinal:
-        nome = "Rejeição Dupla na Zona Chave"
-        return sinal, nome, EXPIRACAO[nome]
-
-    sinal = estrategia_quebra_reteste(par, epochs, O, H, L, C, rsi, atr, piv, vols)
-    if sinal:
-        nome = "Quebra e Reteste Limpos"
-        return sinal, nome, EXPIRACAO[nome]
-
-    sinal = estrategia_absorcao(par, O, H, L, C, rsi, ema20, ema50)
-    if sinal:
-        nome = "Absorção de Força"
-        return sinal, nome, EXPIRACAO[nome]
-
+    r = sinal_retracao(par, O, H, L, C, zonas, atr5)
+    if r:
+        sinal, zona = r
+        return sinal, NOME_ESTRATEGIA, EXPIRACAO_VELAS, zona
     return None
 
 
-# ---------------------------------------------------------------- execução
-
-def executar_sinal(par, sinal, epoch_vela, estrategia, exp_velas):
+# ------------------------------------------------------------ execução
+def executar_sinal(par, sinal, epoch_vela, estrategia, exp_velas, zona):
     try:
         preco_entrada = preco_atual(par)
         if preco_entrada is None:
@@ -395,6 +429,8 @@ def executar_sinal(par, sinal, epoch_vela, estrategia, exp_velas):
         nome = par.replace("frx", "")
         minutos = 5 * exp_velas
         tempo = f"{minutos} Minutos ({exp_velas} vela{'s' if exp_velas > 1 else ''} M5)"
+        d = casas(par)
+        faixa_zona = f"{zona['low']:.{d}f} - {zona['high']:.{d}f}"
 
         enviar_mensagem(f"""
 🚨 *SINAL DETECTADO* 📊
@@ -404,6 +440,9 @@ def executar_sinal(par, sinal, epoch_vela, estrategia, exp_velas):
 *AÇÃO:* {sinal} {emoji}
 *ENTRADA:* `{preco_entrada}`
 *EXPIRAÇÃO:* {tempo}
+
+*ZONA:* `{faixa_zona}`
+*FORÇA:* {zona['score']}/9 ({zona['origem']}, {zona['toques']} toque(s))
 
 ⚠️ _Respeite o seu gerenciamento!_
 """)
@@ -449,13 +488,16 @@ def executar_sinal(par, sinal, epoch_vela, estrategia, exp_velas):
 
     except Exception as e:
         print(f"[ERRO EXECUCAO] {par}: {e}")
+    finally:
+        with estado_lock:
+            sinais_abertos.discard(par)
 
 
 def loop_principal():
     teste = pegar_velas(PARES[0], 300, 3)
     if teste:
         print(f"✅ Dados da Deriv funcionando. Pares: {PARES}")
-        print(f"⏱️ Expirações configuradas: Rejeição=15min | Quebra=20min | Absorção=15min | Trend=5min")
+        print(f"🎯 {NOME_ESTRATEGIA} | força mínima {SCORE_MIN} | expiração {EXPIRACAO_VELAS} velas M5")
     else:
         print("❌ Não consegui ler dados da Deriv (confira o par ou o mercado aberto)")
 
@@ -466,18 +508,25 @@ def loop_principal():
                 velas = pegar_velas(par, 300, QTD_VELAS)
                 if not velas or len(velas) < 100:
                     continue
-                epoch = int(velas[-1]['epoch'])
+                epoch = int(velas[-1]["epoch"])
                 if ultimo_processado.get(par) == epoch:
                     continue
                 ultimo_processado[par] = epoch
                 if time.time() - epoch > JANELA_ENTRADA:
                     continue
+                if em_pausa() or not horario_permitido():
+                    continue
+                with estado_lock:
+                    if par in sinais_abertos:
+                        continue
                 resultado = analisar_estrategia(par, velas)
                 if resultado:
-                    sinal, estrategia, exp_velas = resultado
+                    sinal, estrategia, exp_velas, zona = resultado
+                    with estado_lock:
+                        sinais_abertos.add(par)
                     threading.Thread(
                         target=executar_sinal,
-                        args=(par, sinal, epoch, estrategia, exp_velas),
+                        args=(par, sinal, epoch, estrategia, exp_velas, zona),
                         daemon=True,
                     ).start()
             except Exception as e:
